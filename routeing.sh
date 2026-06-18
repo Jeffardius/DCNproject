@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # arch-ipv4-forward.sh – Enable full IPv4 forwarding using iptables on Arch Linux
-# Run as root. Modifies existing sysctl files, does not create new ones.
+# Run as root. Edits existing sysctl files; creates one only if none exist.
 
 set -euo pipefail
 
@@ -39,20 +39,19 @@ install_iptables() {
 }
 
 # ----------------------------------------------------------------------
-# 2. Enable IPv4 forwarding persistently by editing existing sysctl files
-#    (no new files are created)
+# 2. Enable IPv4 forwarding persistently by editing an existing sysctl file,
+#    or creating a new one if none exists.
 # ----------------------------------------------------------------------
 enable_ip_forward() {
-    local sysctl_file=""
     local param="net.ipv4.ip_forward"
     local value="1"
+    local sysctl_file=""
 
-    # Find an existing sysctl configuration file to edit
-    # Prefer /etc/sysctl.conf, then any .conf in /etc/sysctl.d/
+    # Try to find an existing sysctl configuration file
     if [[ -f /etc/sysctl.conf ]]; then
         sysctl_file="/etc/sysctl.conf"
     else
-        # Find the first .conf file in /etc/sysctl.d/ (sorted alphabetically)
+        # Look for any .conf in /etc/sysctl.d/
         shopt -s nullglob
         local candidates=(/etc/sysctl.d/*.conf)
         if [[ ${#candidates[@]} -gt 0 ]]; then
@@ -75,13 +74,19 @@ enable_ip_forward() {
             info "Appended ${param} = ${value} to $sysctl_file"
         fi
     else
-        warn "No existing sysctl configuration file found (checked /etc/sysctl.conf and /etc/sysctl.d/*.conf)."
-        warn "IP forwarding will NOT persist across reboots. Only setting it temporarily."
+        # No existing file found – create one
+        sysctl_file="/etc/sysctl.d/99-ipv4-forward.conf"
+        info "No existing sysctl file found. Creating $sysctl_file"
+        echo "${param} = ${value}" > "$sysctl_file"
+        info "Created $sysctl_file with ${param} = ${value}"
     fi
 
-    # Apply immediately to the running kernel
+    # Apply settings from all sysctl files
+    sysctl --system >/dev/null || warn "sysctl --system returned non-zero."
+
+    # Also apply immediately to the running kernel (in case --system didn't catch it)
     sysctl -w net.ipv4.ip_forward=1 >/dev/null || warn "Failed to set net.ipv4.ip_forward temporarily."
-    info "IPv4 forwarding enabled for the current session."
+    info "IPv4 forwarding enabled for the current session and will persist across reboots."
 }
 
 # ----------------------------------------------------------------------
@@ -106,8 +111,7 @@ main() {
 
     echo
     echo "============================================================="
-    echo "IPv4 forwarding is now enabled (temporarily and persistently"
-    echo "if a sysctl file was found and edited)."
+    echo "IPv4 forwarding is now enabled (persistently)."
     echo "The iptables FORWARD chain accepts all IPv4 traffic."
     echo "============================================================="
     echo
