@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# auto-network-config.sh – Pure systemd-networkd, no extra daemons.
+# auto-network-config.sh – Full configuration with NAT on Orange.
 # Run as root on each VM.
 
 set -euo pipefail
@@ -9,7 +9,7 @@ info() { echo "INFO: $*"; }
 check_root() { [[ $EUID -eq 0 ]] || die "Must be run as root."; }
 
 # ----------------------------------------------------------------------
-# Install bridge-utils if needed (only for WAP)
+# Install packages
 # ----------------------------------------------------------------------
 install_pkg() {
     local pkg="$1"
@@ -22,7 +22,7 @@ install_pkg() {
 }
 
 # ----------------------------------------------------------------------
-# Enable and start systemd-networkd
+# Enable systemd-networkd
 # ----------------------------------------------------------------------
 enable_networkd() {
     systemctl enable systemd-networkd 2>/dev/null || true
@@ -30,7 +30,7 @@ enable_networkd() {
 }
 
 # ----------------------------------------------------------------------
-# Get interface by index (order from ip link – matches VirtualBox order)
+# Get interface by index (no sorting – uses VirtualBox order)
 # ----------------------------------------------------------------------
 get_interface_by_index() {
     local index="$1"
@@ -41,28 +41,22 @@ get_interface_by_index() {
 }
 
 # ----------------------------------------------------------------------
-# COMPLETE CLEANUP – removes ALL previous IPs, routes, and .network files
+# Full cleanup
 # ----------------------------------------------------------------------
 full_cleanup() {
     info "Performing complete network cleanup..."
-
-    # Flush ALL IPs from ALL interfaces (except lo)
     for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$'); do
         ip addr flush dev "$iface" 2>/dev/null || true
-        info "Flushed $iface"
     done
-
-    # Remove ALL routes
     ip route flush all 2>/dev/null || true
-
-    # Remove ALL systemd-networkd config files we created
     rm -f /etc/systemd/network/*.network 2>/dev/null || true
-
+    iptables -t nat -F 2>/dev/null || true
+    iptables -F FORWARD 2>/dev/null || true
     info "Cleanup complete."
 }
 
 # ----------------------------------------------------------------------
-# Assign static IP + optional gateway (using systemd-networkd)
+# Assign static IP + gateway
 # ----------------------------------------------------------------------
 assign_ip() {
     local interface="$1"
@@ -71,7 +65,6 @@ assign_ip() {
     local gateway="${4:-}"
 
     info "Assigning $ip/$prefix to $interface"
-
     ip addr flush dev "$interface" 2>/dev/null || true
     ip addr add "$ip/$prefix" dev "$interface"
     ip link set dev "$interface" up
@@ -92,52 +85,69 @@ EOF
         ip route add default via "$gateway" 2>/dev/null || true
         info "Default gateway set to $gateway"
     fi
-
-    info "Persistent config: $config_file"
 }
 
 # ----------------------------------------------------------------------
-# Setup NAT adapter with DHCP (systemd-networkd only)
+# Setup DHCP on NAT adapter (systemd-networkd)
 # ----------------------------------------------------------------------
 setup_nat_dhcp() {
     local interface="$1"
-    info "Setting up NAT adapter $interface with DHCP (systemd-networkd)"
-
+    info "Setting up NAT adapter $interface with DHCP"
     ip link set dev "$interface" up
-
     local netdir="/etc/systemd/network"
     mkdir -p "$netdir"
-    local config_file="$netdir/10-${interface}-dhcp.network"
-    cat > "$config_file" <<EOF
+    cat > "$netdir/10-${interface}-dhcp.network" <<EOF
 [Match]
 Name=$interface
 
 [Network]
 DHCP=yes
 EOF
-
-    info "DHCP config created: $config_file"
-    # systemd-networkd will pick it up after restart
 }
 
 # ----------------------------------------------------------------------
-# Setup WAP bridge (using systemd-networkd)
+# Setup NAT (Masquerade) on Orange
+# ----------------------------------------------------------------------
+setup_nat() {
+    local nat_interface="$1"
+    info "Setting up NAT (masquerade) on $nat_interface"
+
+    install_pkg "iptables"
+
+    # Enable IP forwarding permanently
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ipforward.conf
+
+    # Flush old rules
+    iptables -t nat -F
+    iptables -F FORWARD
+    iptables -P FORWARD ACCEPT
+
+    # MASQUERADE traffic going out the NAT interface
+    iptables -t nat -A POSTROUTING -o "$nat_interface" -j MASQUERADE
+
+    # Save rules persistently
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/iptables.rules
+    systemctl enable iptables 2>/dev/null || true
+    systemctl restart iptables 2>/dev/null || true
+
+    info "NAT configured."
+}
+
+# ----------------------------------------------------------------------
+# Setup WAP bridge
 # ----------------------------------------------------------------------
 setup_wap_bridge() {
     install_pkg "bridge-utils"
-
     local wired=$(get_interface_by_index 1)
     local wireless=$(get_interface_by_index 2)
 
-    # Remove any existing bridge
     ip link set br0 down 2>/dev/null || true
     brctl delbr br0 2>/dev/null || true
-
-    # Create bridge
     brctl addbr br0
     brctl addif br0 "$wired"
     brctl addif br0 "$wireless"
-
     ip link set br0 up
     ip link set "$wired" up
     ip link set "$wireless" up
@@ -146,26 +156,21 @@ setup_wap_bridge() {
 }
 
 # ----------------------------------------------------------------------
-# Add static routes on Orange Router (persistent)
+# Static routes on Orange
 # ----------------------------------------------------------------------
 add_static_routes_orange() {
-    info "Adding static routes on Orange Router..."
-
-    # Remove old routes first
+    info "Adding static routes on Orange..."
     ip route del 192.168.37.0/24 2>/dev/null || true
     ip route del 192.168.34.0/24 2>/dev/null || true
     ip route del 192.168.35.0/24 2>/dev/null || true
 
-    # Add new routes
-    ip route add 192.168.37.0/24 via 10.0.1.1 || true
-    ip route add 192.168.34.0/24 via 10.0.2.2 || true
-    ip route add 192.168.35.0/24 via 10.0.2.2 || true
+    ip route add 192.168.37.0/24 via 10.0.1.1
+    ip route add 192.168.34.0/24 via 10.0.2.2
+    ip route add 192.168.35.0/24 via 10.0.2.2
 
-    # Make persistent via systemd-networkd route files
     local netdir="/etc/systemd/network"
     mkdir -p "$netdir"
-    local route_file="$netdir/10-static-routes.network"
-    cat > "$route_file" <<EOF
+    cat > "$netdir/10-static-routes.network" <<EOF
 [Route]
 Destination=192.168.37.0/24
 Gateway=10.0.1.1
@@ -178,7 +183,6 @@ Gateway=10.0.2.2
 Destination=192.168.35.0/24
 Gateway=10.0.2.2
 EOF
-    info "Static routes added."
 }
 
 # ----------------------------------------------------------------------
@@ -187,10 +191,7 @@ EOF
 main() {
     check_root
 
-    # COMPLETE CLEANUP
     full_cleanup
-
-    # Enable systemd-networkd (will restart later)
     enable_networkd
 
     local hostname=$(hostname)
@@ -214,9 +215,8 @@ main() {
             assign_ip "$nic2" "10.0.2.1" "30"
             assign_ip "$nic3" "172.36.0.1" "16"
 
-            # NAT adapter: DHCP via systemd-networkd
             setup_nat_dhcp "$nic4"
-
+            setup_nat "$nic4"               # <-- NEW: enables NAT masquerade
             add_static_routes_orange
             ;;
 
@@ -268,29 +268,20 @@ main() {
             ;;
     esac
 
-    # Restart systemd-networkd to apply all changes
     systemctl restart systemd-networkd
 
     info "Configuration complete for $hostname"
-    echo
-    echo "============================================================="
-    echo "Final configuration:"
-    echo "============================================================="
     echo
     echo "Current IPv4 addresses:"
     ip -4 addr show | grep -E "inet " | grep -v "127.0.0.1" | sort
     echo
     echo "Default gateway:"
     ip route show default 2>/dev/null || echo "No default route set"
-    echo
     if [[ "$hostname" == "orange-router" ]]; then
-        echo "Static routes on Orange:"
-        ip route show | grep "192.168" || echo "No static routes found"
+        echo
+        echo "NAT rules:"
+        iptables -t nat -L POSTROUTING -v -n | grep MASQUERADE
     fi
-    echo
-    echo "============================================================="
-    echo "All configs are stored in /etc/systemd/network/"
-    echo "Run 'ip addr' to verify."
 }
 
 main "$@"
