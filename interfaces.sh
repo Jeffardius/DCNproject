@@ -154,24 +154,22 @@ setup_nat() {
 # Setup WAP bridge (systemd-networkd + bridge-utils)
 # ----------------------------------------------------------------------
 setup_wap_bridge() {
-    install_pkg "bridge-utils"
     local wired=$(get_interface_by_index 1)
     local wireless=$(get_interface_by_index 2)
 
-    # Remove any existing bridge
+    # Remove any existing bridge (ignore errors)
     ip link set br0 down 2>/dev/null || true
-    brctl delbr br0 2>/dev/null || true
+    ip link del br0 2>/dev/null || true
 
-    # Create bridge
-    brctl addbr br0
-    brctl addif br0 "$wired"
-    brctl addif br0 "$wireless"
-
+    # Create a new bridge
+    ip link add name br0 type bridge
+    ip link set dev "$wired" master br0
+    ip link set dev "$wireless" master br0
     ip link set br0 up
     ip link set "$wired" up
     ip link set "$wireless" up
 
-    # Assign management IP to the bridge (with gateway = YG Router)
+    # Assign management IP to the bridge (gateway = YG Router)
     assign_ip "br0" "192.168.34.20" "24" "192.168.34.1"
 }
 
