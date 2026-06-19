@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# auto-network-config.sh – Final version with corrected topology
+# auto-network-config.sh – Fixed version without alphabetical sorting.
 # Run as root on each VM.
 
 set -euo pipefail
@@ -30,12 +30,13 @@ enable_networkd() {
 }
 
 # ----------------------------------------------------------------------
-# Get interface by index (sorted alphabetically)
+# Get interface by index (in the order they appear from ip link)
+# NO SORTING – this preserves VirtualBox adapter order.
 # ----------------------------------------------------------------------
 get_interface_by_index() {
     local index="$1"
     local adapters
-    mapfile -t adapters < <(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' | sort)
+    mapfile -t adapters < <(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$')
     [[ ${#adapters[@]} -ge "$index" ]] || die "Not enough interfaces for index $index"
     echo "${adapters[$((index-1))]}"
 }
@@ -92,7 +93,7 @@ setup_wap_bridge() {
 }
 
 # ----------------------------------------------------------------------
-# Add static routes on Orange Router
+# Add static routes on Orange Router (persistent)
 # ----------------------------------------------------------------------
 add_static_routes_orange() {
     info "Adding static routes on Orange Router..."
@@ -100,7 +101,7 @@ add_static_routes_orange() {
     ip route add 192.168.34.0/24 via 10.0.2.2 2>/dev/null || true
     ip route add 192.168.35.0/24 via 10.0.2.2 2>/dev/null || true
 
-    # Make them persistent by adding to a network config
+    # Make persistent
     local netdir="/etc/systemd/network"
     mkdir -p "$netdir"
     local route_file="$netdir/10-static-routes.network"
@@ -144,16 +145,15 @@ main() {
             local nic3=$(get_interface_by_index 3)
             local nic4=$(get_interface_by_index 4)
 
-            assign_ip "$nic1" "10.0.1.2" "30"
-            assign_ip "$nic2" "10.0.2.1" "30"
-            assign_ip "$nic3" "172.36.0.1" "16"
+            assign_ip "$nic1" "10.0.1.2" "30"      # Blue link
+            assign_ip "$nic2" "10.0.2.1" "30"      # YG link
+            assign_ip "$nic3" "172.36.0.1" "16"    # Orange devices
 
-            # NAT adapter: DHCP
+            # NAT adapter (NIC 4): DHCP
             ip link set dev "$nic4" up
             dhcpcd "$nic4" 2>/dev/null || true
             info "NAT adapter $nic4 configured via DHCP (internet access)."
 
-            # Add static routes to reach Blue, Yellow, Green
             add_static_routes_orange
             ;;
 
