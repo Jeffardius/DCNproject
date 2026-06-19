@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# orange-router-fix.sh – Ultimate fix for Orange Router.
+# orange-router-final.sh – The final, clean solution.
 # Run as root ONCE.
 
 set -euo pipefail
@@ -21,90 +21,60 @@ find_nat_interface() {
 }
 
 # ----------------------------------------------------------------------
-# Ensure the link to Blue is up and has the correct IP
+# Clean up weird routes (from DHCP classless static routes)
 # ----------------------------------------------------------------------
-check_blue_link() {
-    info "Checking link to Blue..."
-    if ! ip addr show | grep -q "10.0.1.2/30"; then
-        die "Orange's link IP (10.0.1.2) is not configured. Run auto-network-config.sh first."
-    fi
-    # Check if 10.0.1.1 is reachable
-    if ping -c 1 -W 1 10.0.1.1 &>/dev/null; then
-        info "Link to Blue is up (10.0.1.1 reachable)."
-    else
-        warn "Cannot ping 10.0.1.1 – check VirtualBox Internal Network 'net-blue-orange'."
-        warn "Continuing anyway (route will be added)."
-    fi
+clean_weird_routes() {
+    info "Removing weird DHCP routes..."
+    for dest in 47.71.255.198 64.71.255.198 64.71.255.204 192.168.0.1; do
+        if ip route del "$dest" 2>/dev/null; then
+            info "Removed $dest"
+        fi
+    done
 }
 
 # ----------------------------------------------------------------------
-# Wipe old static routes and add correct ones
+# Add/Replace static routes
 # ----------------------------------------------------------------------
-add_routes_now() {
-    info "Wiping old static routes..."
-    ip route del 192.168.37.0/24 2>/dev/null || true
-    ip route del 192.168.34.0/24 2>/dev/null || true
-    ip route del 192.168.35.0/24 2>/dev/null || true
+add_routes() {
+    info "Adding/replacing static routes..."
+    # Use 'replace' to ensure only one entry
+    ip route replace 192.168.37.0/24 via 10.0.1.1
+    ip route replace 192.168.34.0/24 via 10.0.2.2
+    ip route replace 192.168.35.0/24 via 10.0.2.2
 
-    info "Adding static routes..."
-
-    # Add route to Blue's server network (192.168.37.0/24)
-    if ip route add 192.168.37.0/24 via 10.0.1.1; then
-        info "✅ Route to 192.168.37.0/24 added via 10.0.1.1"
-    else
-        die "❌ Failed to add route to 192.168.37.0/24 – check link to Blue."
-    fi
-
-    # Route to Yellow
-    if ip route add 192.168.34.0/24 via 10.0.2.2; then
-        info "✅ Route to 192.168.34.0/24 added via 10.0.2.2"
-    else
-        die "❌ Failed to add route to 192.168.34.0/24 – check link to YG."
-    fi
-
-    # Route to Green
-    if ip route add 192.168.35.0/24 via 10.0.2.2; then
-        info "✅ Route to 192.168.35.0/24 added via 10.0.2.2"
-    else
-        die "❌ Failed to add route to 192.168.35.0/24 – check link to YG."
-    fi
-
-    info "All routes added successfully:"
+    info "Routes added:"
     ip route show | grep "192.168"
 }
 
 # ----------------------------------------------------------------------
-# Create a script to reapply routes at boot
+# Create boot script and systemd service (fast start)
 # ----------------------------------------------------------------------
-create_persistent_script() {
-    info "Creating /usr/local/bin/add-orange-routes.sh..."
-    cat > /usr/local/bin/add-orange-routes.sh <<'EOF'
+install_service() {
+    info "Creating /usr/local/bin/clean-orange-routes.sh..."
+    cat > /usr/local/bin/clean-orange-routes.sh <<'EOF'
 #!/bin/bash
-# Reapply static routes for Orange Router
-ip route add 192.168.37.0/24 via 10.0.1.1 2>/dev/null || true
-ip route add 192.168.34.0/24 via 10.0.2.2 2>/dev/null || true
-ip route add 192.168.35.0/24 via 10.0.2.2 2>/dev/null || true
+# Cleanup weird routes and add static ones
+for dest in 47.71.255.198 64.71.255.198 64.71.255.204 192.168.0.1; do
+    ip route del "$dest" 2>/dev/null
+done
+ip route replace 192.168.37.0/24 via 10.0.1.1
+ip route replace 192.168.34.0/24 via 10.0.2.2
+ip route replace 192.168.35.0/24 via 10.0.2.2
 # Also ensure NAT is set
 iptables -t nat -A POSTROUTING -o $(ip route show default | awk '{print $5}') -j MASQUERADE 2>/dev/null || true
 EOF
-    chmod +x /usr/local/bin/add-orange-routes.sh
-    info "Persistent script created."
-}
+    chmod +x /usr/local/bin/clean-orange-routes.sh
 
-# ----------------------------------------------------------------------
-# Create systemd service that runs the script at boot
-# ----------------------------------------------------------------------
-install_systemd_service() {
-    info "Creating systemd service..."
-    cat > /etc/systemd/system/add-orange-routes.service <<'EOF'
+    info "Creating systemd service (fast network start)..."
+    cat > /etc/systemd/system/clean-orange-routes.service <<'EOF'
 [Unit]
-Description=Add static routes for Orange Router
-After=network-online.target
-Wants=network-online.target
+Description=Clean and add static routes for Orange Router
+After=network.target
+Wants=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/add-orange-routes.sh
+ExecStart=/usr/local/bin/clean-orange-routes.sh
 RemainAfterExit=yes
 
 [Install]
@@ -112,40 +82,34 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable add-orange-routes.service
-    systemctl start add-orange-routes.service
-    info "Service enabled and started."
+    systemctl enable clean-orange-routes.service
+    systemctl start clean-orange-routes.service
+    info "Service installed and started."
 }
 
 # ----------------------------------------------------------------------
-# Setup NAT (MASQUERADE) on Orange
+# Setup NAT (MASQUERADE)
 # ----------------------------------------------------------------------
 setup_nat() {
     local nat_iface="$1"
-    info "Setting up NAT (MASQUERADE) on $nat_iface..."
+    info "Setting up NAT on $nat_iface..."
 
-    # Install iptables if missing
-    if ! pacman -Q iptables &>/dev/null; then
-        pacman -S --noconfirm iptables || die "Failed to install iptables"
-    fi
+    pacman -Q iptables &>/dev/null || pacman -S --noconfirm iptables
 
-    # Enable forwarding
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
     echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ipforward.conf
 
-    # Flush and set rules
     iptables -t nat -F
     iptables -F FORWARD
     iptables -P FORWARD ACCEPT
     iptables -t nat -A POSTROUTING -o "$nat_iface" -j MASQUERADE
 
-    # Save rules persistently
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/iptables.rules
     systemctl enable iptables 2>/dev/null || true
     systemctl restart iptables 2>/dev/null || true
 
-    info "NAT configured on $nat_iface."
+    info "NAT configured."
 }
 
 # ----------------------------------------------------------------------
@@ -156,26 +120,21 @@ main() {
 
     local nat_iface
     nat_iface=$(find_nat_interface)
-    info "NAT interface detected: $nat_iface"
+    info "NAT interface: $nat_iface"
 
-    check_blue_link
-
-    add_routes_now
-    create_persistent_script
-    install_systemd_service
+    clean_weird_routes
+    add_routes
+    install_service
     setup_nat "$nat_iface"
 
     echo
     echo "============================================================="
-    echo "✅ Orange Router is now fixed and persistent."
-    echo "Routes and NAT will survive reboots."
+    echo "✅ Orange Router is now fully clean and persistent."
+    echo "Weird routes removed, static routes added, NAT set."
+    echo "Service will reapply at boot (fast start)."
     echo "============================================================="
-    echo "Current routes:"
+    echo "Final routing table:"
     ip route show
-    echo
-    echo "Test connectivity from Blue Server (192.168.37.100):"
-    echo "  ping 172.36.0.1"
-    echo "  ping 1.1.1.1"
 }
 
 main "$@"
