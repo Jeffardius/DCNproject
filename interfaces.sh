@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# auto-network-config.sh – Fixed version without alphabetical sorting.
+# auto-network-config.sh – Perfect version with full cleanup.
 # Run as root on each VM.
 
 set -euo pipefail
@@ -31,7 +31,7 @@ enable_networkd() {
 
 # ----------------------------------------------------------------------
 # Get interface by index (in the order they appear from ip link)
-# NO SORTING – this preserves VirtualBox adapter order.
+# NO SORTING – preserves VirtualBox adapter order.
 # ----------------------------------------------------------------------
 get_interface_by_index() {
     local index="$1"
@@ -42,7 +42,34 @@ get_interface_by_index() {
 }
 
 # ----------------------------------------------------------------------
-# Assign IP + optional gateway
+# COMPLETE CLEANUP – removes ALL previous IPs, routes, and configs
+# ----------------------------------------------------------------------
+full_cleanup() {
+    info "Performing complete network cleanup..."
+
+    # 1. Kill any DHCP clients
+    pkill dhcpcd 2>/dev/null || true
+
+    # 2. Flush ALL IPs from ALL interfaces (except lo)
+    for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$'); do
+        ip addr flush dev "$iface" 2>/dev/null || true
+        info "Flushed $iface"
+    done
+
+    # 3. Remove ALL routes
+    ip route flush all 2>/dev/null || true
+
+    # 4. Remove ALL systemd-networkd config files we created
+    rm -f /etc/systemd/network/*.network 2>/dev/null || true
+
+    # 5. Remove DHCP leases
+    rm -f /var/lib/dhcpcd/*.lease 2>/dev/null || true
+
+    info "Cleanup complete. All previous network configs removed."
+}
+
+# ----------------------------------------------------------------------
+# Assign IP + optional gateway (with double-check to prevent duplicates)
 # ----------------------------------------------------------------------
 assign_ip() {
     local interface="$1"
@@ -51,10 +78,15 @@ assign_ip() {
     local gateway="${4:-}"
 
     info "Assigning $ip/$prefix to $interface"
+
+    # Remove any existing IP on this interface
     ip addr flush dev "$interface" 2>/dev/null || true
+
+    # Add the new IP
     ip addr add "$ip/$prefix" dev "$interface"
     ip link set dev "$interface" up
 
+    # Create persistent config
     local netdir="/etc/systemd/network"
     mkdir -p "$netdir"
     local config_file="$netdir/20-${interface}.network"
@@ -71,6 +103,11 @@ EOF
         ip route add default via "$gateway" 2>/dev/null || true
         info "Default gateway set to $gateway"
     fi
+
+    # Verify the IP was assigned correctly
+    if ! ip addr show "$interface" | grep -q "$ip/$prefix"; then
+        die "Failed to assign $ip/$prefix to $interface"
+    fi
 }
 
 # ----------------------------------------------------------------------
@@ -78,12 +115,18 @@ EOF
 # ----------------------------------------------------------------------
 setup_wap_bridge() {
     install_pkg "bridge-utils"
+
     local wired=$(get_interface_by_index 1)
     local wireless=$(get_interface_by_index 2)
 
-    brctl addbr br0 2>/dev/null || true
-    brctl addif br0 "$wired" 2>/dev/null || true
-    brctl addif br0 "$wireless" 2>/dev/null || true
+    # Remove any existing bridge
+    ip link set br0 down 2>/dev/null || true
+    brctl delbr br0 2>/dev/null || true
+
+    # Create bridge
+    brctl addbr br0
+    brctl addif br0 "$wired"
+    brctl addif br0 "$wireless"
 
     ip link set br0 up
     ip link set "$wired" up
@@ -97,9 +140,16 @@ setup_wap_bridge() {
 # ----------------------------------------------------------------------
 add_static_routes_orange() {
     info "Adding static routes on Orange Router..."
-    ip route add 192.168.37.0/24 via 10.0.1.1 2>/dev/null || true
-    ip route add 192.168.34.0/24 via 10.0.2.2 2>/dev/null || true
-    ip route add 192.168.35.0/24 via 10.0.2.2 2>/dev/null || true
+
+    # Remove old routes first
+    ip route del 192.168.37.0/24 2>/dev/null || true
+    ip route del 192.168.34.0/24 2>/dev/null || true
+    ip route del 192.168.35.0/24 2>/dev/null || true
+
+    # Add new routes
+    ip route add 192.168.37.0/24 via 10.0.1.1 || true
+    ip route add 192.168.34.0/24 via 10.0.2.2 || true
+    ip route add 192.168.35.0/24 via 10.0.2.2 || true
 
     # Make persistent
     local netdir="/etc/systemd/network"
@@ -118,7 +168,7 @@ Gateway=10.0.2.2
 Destination=192.168.35.0/24
 Gateway=10.0.2.2
 EOF
-    info "Static routes added and made persistent."
+    info "Static routes added."
 }
 
 # ----------------------------------------------------------------------
@@ -126,6 +176,11 @@ EOF
 # ----------------------------------------------------------------------
 main() {
     check_root
+
+    # COMPLETE CLEANUP FIRST
+    full_cleanup
+
+    # Now configure
     enable_networkd
 
     local hostname=$(hostname)
@@ -145,14 +200,14 @@ main() {
             local nic3=$(get_interface_by_index 3)
             local nic4=$(get_interface_by_index 4)
 
-            assign_ip "$nic1" "10.0.1.2" "30"      # Blue link
-            assign_ip "$nic2" "10.0.2.1" "30"      # YG link
-            assign_ip "$nic3" "172.36.0.1" "16"    # Orange devices
+            assign_ip "$nic1" "10.0.1.2" "30"
+            assign_ip "$nic2" "10.0.2.1" "30"
+            assign_ip "$nic3" "172.36.0.1" "16"
 
             # NAT adapter (NIC 4): DHCP
             ip link set dev "$nic4" up
             dhcpcd "$nic4" 2>/dev/null || true
-            info "NAT adapter $nic4 configured via DHCP (internet access)."
+            info "NAT adapter $nic4 configured via DHCP."
 
             add_static_routes_orange
             ;;
@@ -207,16 +262,24 @@ main() {
 
     info "Configuration complete for $hostname"
     echo
+    echo "============================================================="
+    echo "Final configuration:"
+    echo "============================================================="
+    echo
     echo "Current IPv4 addresses:"
-    ip -4 addr show | grep -E "inet " | grep -v "127.0.0.1"
+    ip -4 addr show | grep -E "inet " | grep -v "127.0.0.1" | sort
     echo
     echo "Default gateway:"
     ip route show default 2>/dev/null || echo "No default route set"
     echo
     if [[ "$hostname" == "orange-router" ]]; then
         echo "Static routes on Orange:"
-        ip route show | grep "192.168"
+        ip route show | grep "192.168" || echo "No static routes found"
     fi
+    echo
+    echo "============================================================="
+    echo "All interfaces should now have unique, correct IPs."
+    echo "Run 'ip addr' to verify."
 }
 
 main "$@"
