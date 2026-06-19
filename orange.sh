@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fix-orange-routes.sh – Permanently fixes static routes on Orange Router.
+# orange-router-fix.sh – Ultimate fix for Orange Router.
 # Run as root ONCE.
 
 set -euo pipefail
@@ -21,6 +21,23 @@ find_nat_interface() {
 }
 
 # ----------------------------------------------------------------------
+# Ensure the link to Blue is up and has the correct IP
+# ----------------------------------------------------------------------
+check_blue_link() {
+    info "Checking link to Blue..."
+    if ! ip addr show | grep -q "10.0.1.2/30"; then
+        die "Orange's link IP (10.0.1.2) is not configured. Run auto-network-config.sh first."
+    fi
+    # Check if 10.0.1.1 is reachable
+    if ping -c 1 -W 1 10.0.1.1 &>/dev/null; then
+        info "Link to Blue is up (10.0.1.1 reachable)."
+    else
+        warn "Cannot ping 10.0.1.1 – check VirtualBox Internal Network 'net-blue-orange'."
+        warn "Continuing anyway (route will be added)."
+    fi
+}
+
+# ----------------------------------------------------------------------
 # Wipe old static routes and add correct ones
 # ----------------------------------------------------------------------
 add_routes_now() {
@@ -30,11 +47,29 @@ add_routes_now() {
     ip route del 192.168.35.0/24 2>/dev/null || true
 
     info "Adding static routes..."
-    ip route add 192.168.37.0/24 via 10.0.1.1
-    ip route add 192.168.34.0/24 via 10.0.2.2
-    ip route add 192.168.35.0/24 via 10.0.2.2
 
-    info "Routes added:"
+    # Add route to Blue's server network (192.168.37.0/24)
+    if ip route add 192.168.37.0/24 via 10.0.1.1; then
+        info "✅ Route to 192.168.37.0/24 added via 10.0.1.1"
+    else
+        die "❌ Failed to add route to 192.168.37.0/24 – check link to Blue."
+    fi
+
+    # Route to Yellow
+    if ip route add 192.168.34.0/24 via 10.0.2.2; then
+        info "✅ Route to 192.168.34.0/24 added via 10.0.2.2"
+    else
+        die "❌ Failed to add route to 192.168.34.0/24 – check link to YG."
+    fi
+
+    # Route to Green
+    if ip route add 192.168.35.0/24 via 10.0.2.2; then
+        info "✅ Route to 192.168.35.0/24 added via 10.0.2.2"
+    else
+        die "❌ Failed to add route to 192.168.35.0/24 – check link to YG."
+    fi
+
+    info "All routes added successfully:"
     ip route show | grep "192.168"
 }
 
@@ -49,8 +84,11 @@ create_persistent_script() {
 ip route add 192.168.37.0/24 via 10.0.1.1 2>/dev/null || true
 ip route add 192.168.34.0/24 via 10.0.2.2 2>/dev/null || true
 ip route add 192.168.35.0/24 via 10.0.2.2 2>/dev/null || true
+# Also ensure NAT is set
+iptables -t nat -A POSTROUTING -o $(ip route show default | awk '{print $5}') -j MASQUERADE 2>/dev/null || true
 EOF
     chmod +x /usr/local/bin/add-orange-routes.sh
+    info "Persistent script created."
 }
 
 # ----------------------------------------------------------------------
@@ -120,6 +158,8 @@ main() {
     nat_iface=$(find_nat_interface)
     info "NAT interface detected: $nat_iface"
 
+    check_blue_link
+
     add_routes_now
     create_persistent_script
     install_systemd_service
@@ -127,11 +167,15 @@ main() {
 
     echo
     echo "============================================================="
-    echo "Orange Router is now fixed and persistent."
+    echo "✅ Orange Router is now fixed and persistent."
     echo "Routes and NAT will survive reboots."
     echo "============================================================="
     echo "Current routes:"
     ip route show
+    echo
+    echo "Test connectivity from Blue Server (192.168.37.100):"
+    echo "  ping 172.36.0.1"
+    echo "  ping 1.1.1.1"
 }
 
 main "$@"
