@@ -158,19 +158,27 @@ setup_wap_bridge() {
 # ----------------------------------------------------------------------
 # Static routes on Orange
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Add static routes on Orange Router (persistent)
+# ----------------------------------------------------------------------
 add_static_routes_orange() {
-    info "Adding static routes on Orange..."
+    info "Adding static routes on Orange Router..."
+
+    # Remove old routes if they exist (cleanup)
     ip route del 192.168.37.0/24 2>/dev/null || true
     ip route del 192.168.34.0/24 2>/dev/null || true
     ip route del 192.168.35.0/24 2>/dev/null || true
 
+    # Add new routes immediately
     ip route add 192.168.37.0/24 via 10.0.1.1
     ip route add 192.168.34.0/24 via 10.0.2.2
     ip route add 192.168.35.0/24 via 10.0.2.2
 
+    # Make persistent via systemd-networkd route files
     local netdir="/etc/systemd/network"
     mkdir -p "$netdir"
-    cat > "$netdir/10-static-routes.network" <<EOF
+    local route_file="$netdir/10-static-routes.network"
+    cat > "$route_file" <<EOF
 [Route]
 Destination=192.168.37.0/24
 Gateway=10.0.1.1
@@ -183,6 +191,8 @@ Gateway=10.0.2.2
 Destination=192.168.35.0/24
 Gateway=10.0.2.2
 EOF
+
+    info "Static routes added and made persistent."
 }
 
 # ----------------------------------------------------------------------
