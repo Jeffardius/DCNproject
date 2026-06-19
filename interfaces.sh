@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# auto-network-config.sh – Final version with full routing and persistence.
-# Run as root on each VM. Hostname must match one of the roles.
+# auto-network-config.sh – Complete network setup for your topology.
+# Run as root on each VM. Hostname must match one of the roles below.
 
 set -euo pipefail
 
@@ -10,7 +10,7 @@ warn() { echo "WARNING: $*" >&2; }
 check_root() { [[ $EUID -eq 0 ]] || die "Must be run as root."; }
 
 # ----------------------------------------------------------------------
-# Install missing packages
+# Install missing packages (iptables, bridge-utils)
 # ----------------------------------------------------------------------
 install_pkg() {
     local pkg="$1"
@@ -31,8 +31,7 @@ enable_networkd() {
 }
 
 # ----------------------------------------------------------------------
-# Get interface by index (in the order they appear from ip link)
-# NO SORTING – preserves VirtualBox adapter order.
+# Get interface by index (order from 'ip link' – matches VirtualBox)
 # ----------------------------------------------------------------------
 get_interface_by_index() {
     local index="$1"
@@ -218,10 +217,6 @@ EOF
 main() {
     check_root
 
-    # Install essential packages first
-    install_pkg "systemd"   # already present, but ensures networkd is available
-    # bridge-utils is installed only when needed (in WAP case)
-
     # Full cleanup
     full_cleanup
 
@@ -311,7 +306,7 @@ main() {
             ;;
 
         *)
-            die "Unknown hostname: $hostname. Please set a valid hostname."
+            die "Unknown hostname: $hostname. Please set one of: blue-router, orange-router, yg-router, yellow-wap, green-phone-1, green-phone-2, orange-laptop, blue-server, yellow-laptop-1, yellow-laptop-2."
             ;;
     esac
 
