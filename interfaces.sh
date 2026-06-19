@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# auto-network-config.sh – Perfect version with full cleanup.
+# auto-network-config.sh – Pure systemd-networkd, no extra daemons.
 # Run as root on each VM.
 
 set -euo pipefail
@@ -9,7 +9,7 @@ info() { echo "INFO: $*"; }
 check_root() { [[ $EUID -eq 0 ]] || die "Must be run as root."; }
 
 # ----------------------------------------------------------------------
-# Install missing package
+# Install bridge-utils if needed (only for WAP)
 # ----------------------------------------------------------------------
 install_pkg() {
     local pkg="$1"
@@ -22,7 +22,7 @@ install_pkg() {
 }
 
 # ----------------------------------------------------------------------
-# Enable systemd-networkd
+# Enable and start systemd-networkd
 # ----------------------------------------------------------------------
 enable_networkd() {
     systemctl enable systemd-networkd 2>/dev/null || true
@@ -30,8 +30,7 @@ enable_networkd() {
 }
 
 # ----------------------------------------------------------------------
-# Get interface by index (in the order they appear from ip link)
-# NO SORTING – preserves VirtualBox adapter order.
+# Get interface by index (order from ip link – matches VirtualBox order)
 # ----------------------------------------------------------------------
 get_interface_by_index() {
     local index="$1"
@@ -42,34 +41,28 @@ get_interface_by_index() {
 }
 
 # ----------------------------------------------------------------------
-# COMPLETE CLEANUP – removes ALL previous IPs, routes, and configs
+# COMPLETE CLEANUP – removes ALL previous IPs, routes, and .network files
 # ----------------------------------------------------------------------
 full_cleanup() {
     info "Performing complete network cleanup..."
 
-    # 1. Kill any DHCP clients
-    pkill dhcpcd 2>/dev/null || true
-
-    # 2. Flush ALL IPs from ALL interfaces (except lo)
+    # Flush ALL IPs from ALL interfaces (except lo)
     for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$'); do
         ip addr flush dev "$iface" 2>/dev/null || true
         info "Flushed $iface"
     done
 
-    # 3. Remove ALL routes
+    # Remove ALL routes
     ip route flush all 2>/dev/null || true
 
-    # 4. Remove ALL systemd-networkd config files we created
+    # Remove ALL systemd-networkd config files we created
     rm -f /etc/systemd/network/*.network 2>/dev/null || true
 
-    # 5. Remove DHCP leases
-    rm -f /var/lib/dhcpcd/*.lease 2>/dev/null || true
-
-    info "Cleanup complete. All previous network configs removed."
+    info "Cleanup complete."
 }
 
 # ----------------------------------------------------------------------
-# Assign IP + optional gateway (with double-check to prevent duplicates)
+# Assign static IP + optional gateway (using systemd-networkd)
 # ----------------------------------------------------------------------
 assign_ip() {
     local interface="$1"
@@ -79,14 +72,10 @@ assign_ip() {
 
     info "Assigning $ip/$prefix to $interface"
 
-    # Remove any existing IP on this interface
     ip addr flush dev "$interface" 2>/dev/null || true
-
-    # Add the new IP
     ip addr add "$ip/$prefix" dev "$interface"
     ip link set dev "$interface" up
 
-    # Create persistent config
     local netdir="/etc/systemd/network"
     mkdir -p "$netdir"
     local config_file="$netdir/20-${interface}.network"
@@ -104,14 +93,35 @@ EOF
         info "Default gateway set to $gateway"
     fi
 
-    # Verify the IP was assigned correctly
-    if ! ip addr show "$interface" | grep -q "$ip/$prefix"; then
-        die "Failed to assign $ip/$prefix to $interface"
-    fi
+    info "Persistent config: $config_file"
 }
 
 # ----------------------------------------------------------------------
-# Setup WAP bridge
+# Setup NAT adapter with DHCP (systemd-networkd only)
+# ----------------------------------------------------------------------
+setup_nat_dhcp() {
+    local interface="$1"
+    info "Setting up NAT adapter $interface with DHCP (systemd-networkd)"
+
+    ip link set dev "$interface" up
+
+    local netdir="/etc/systemd/network"
+    mkdir -p "$netdir"
+    local config_file="$netdir/10-${interface}-dhcp.network"
+    cat > "$config_file" <<EOF
+[Match]
+Name=$interface
+
+[Network]
+DHCP=yes
+EOF
+
+    info "DHCP config created: $config_file"
+    # systemd-networkd will pick it up after restart
+}
+
+# ----------------------------------------------------------------------
+# Setup WAP bridge (using systemd-networkd)
 # ----------------------------------------------------------------------
 setup_wap_bridge() {
     install_pkg "bridge-utils"
@@ -151,7 +161,7 @@ add_static_routes_orange() {
     ip route add 192.168.34.0/24 via 10.0.2.2 || true
     ip route add 192.168.35.0/24 via 10.0.2.2 || true
 
-    # Make persistent
+    # Make persistent via systemd-networkd route files
     local netdir="/etc/systemd/network"
     mkdir -p "$netdir"
     local route_file="$netdir/10-static-routes.network"
@@ -177,10 +187,10 @@ EOF
 main() {
     check_root
 
-    # COMPLETE CLEANUP FIRST
+    # COMPLETE CLEANUP
     full_cleanup
 
-    # Now configure
+    # Enable systemd-networkd (will restart later)
     enable_networkd
 
     local hostname=$(hostname)
@@ -204,10 +214,8 @@ main() {
             assign_ip "$nic2" "10.0.2.1" "30"
             assign_ip "$nic3" "172.36.0.1" "16"
 
-            # NAT adapter (NIC 4): DHCP
-            ip link set dev "$nic4" up
-            dhcpcd "$nic4" 2>/dev/null || true
-            info "NAT adapter $nic4 configured via DHCP."
+            # NAT adapter: DHCP via systemd-networkd
+            setup_nat_dhcp "$nic4"
 
             add_static_routes_orange
             ;;
@@ -260,6 +268,9 @@ main() {
             ;;
     esac
 
+    # Restart systemd-networkd to apply all changes
+    systemctl restart systemd-networkd
+
     info "Configuration complete for $hostname"
     echo
     echo "============================================================="
@@ -278,7 +289,7 @@ main() {
     fi
     echo
     echo "============================================================="
-    echo "All interfaces should now have unique, correct IPs."
+    echo "All configs are stored in /etc/systemd/network/"
     echo "Run 'ip addr' to verify."
 }
 
