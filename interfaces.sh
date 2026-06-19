@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# auto-network-config.sh – Auto‑configure IPs, gateways, and WAP bridging.
-# Run as root on each VM. Hostname determines the role.
+# auto-network-config.sh – Final version with corrected topology
+# Run as root on each VM.
 
 set -euo pipefail
 
@@ -9,7 +9,7 @@ info() { echo "INFO: $*"; }
 check_root() { [[ $EUID -eq 0 ]] || die "Must be run as root."; }
 
 # ----------------------------------------------------------------------
-# Install a package if missing (uses pacman)
+# Install missing package
 # ----------------------------------------------------------------------
 install_pkg() {
     local pkg="$1"
@@ -22,7 +22,7 @@ install_pkg() {
 }
 
 # ----------------------------------------------------------------------
-# Enable and start systemd-networkd (for persistence)
+# Enable systemd-networkd
 # ----------------------------------------------------------------------
 enable_networkd() {
     systemctl enable systemd-networkd 2>/dev/null || true
@@ -30,7 +30,7 @@ enable_networkd() {
 }
 
 # ----------------------------------------------------------------------
-# Get interface by index (1st, 2nd, 3rd NIC) – sorted alphabetically
+# Get interface by index (sorted alphabetically)
 # ----------------------------------------------------------------------
 get_interface_by_index() {
     local index="$1"
@@ -41,20 +41,19 @@ get_interface_by_index() {
 }
 
 # ----------------------------------------------------------------------
-# Assign IP, netmask, and optional default gateway (immediate + persistent)
+# Assign IP + optional gateway
 # ----------------------------------------------------------------------
 assign_ip() {
     local interface="$1"
     local ip="$2"
     local prefix="$3"
-    local gateway="${4:-}"   # optional
+    local gateway="${4:-}"
 
     info "Assigning $ip/$prefix to $interface"
     ip addr flush dev "$interface" 2>/dev/null || true
     ip addr add "$ip/$prefix" dev "$interface"
     ip link set dev "$interface" up
 
-    # Persistent config via systemd-networkd
     local netdir="/etc/systemd/network"
     mkdir -p "$netdir"
     local config_file="$netdir/20-${interface}.network"
@@ -68,37 +67,57 @@ EOF
 
     if [[ -n "$gateway" ]]; then
         echo "Gateway=$gateway" >> "$config_file"
-        # Set default route immediately
         ip route add default via "$gateway" 2>/dev/null || true
         info "Default gateway set to $gateway"
     fi
-
-    info "Persistent config: $config_file"
 }
 
 # ----------------------------------------------------------------------
-# Setup WAP bridging (install bridge-utils, create br0, assign IP with gateway)
+# Setup WAP bridge
 # ----------------------------------------------------------------------
 setup_wap_bridge() {
     install_pkg "bridge-utils"
-
     local wired=$(get_interface_by_index 1)
     local wireless=$(get_interface_by_index 2)
 
-    # Create bridge and add interfaces
     brctl addbr br0 2>/dev/null || true
     brctl addif br0 "$wired" 2>/dev/null || true
     brctl addif br0 "$wireless" 2>/dev/null || true
 
-    # Bring up all interfaces
     ip link set br0 up
     ip link set "$wired" up
     ip link set "$wireless" up
 
-    # Assign management IP to the bridge (with gateway = Y/G router)
     assign_ip "br0" "192.168.34.20" "24" "192.168.34.1"
+}
 
-    info "WAP bridge configured: br0 (192.168.34.20/24) with gateway 192.168.34.1"
+# ----------------------------------------------------------------------
+# Add static routes on Orange Router
+# ----------------------------------------------------------------------
+add_static_routes_orange() {
+    info "Adding static routes on Orange Router..."
+    ip route add 192.168.37.0/24 via 10.0.1.1 2>/dev/null || true
+    ip route add 192.168.34.0/24 via 10.0.2.2 2>/dev/null || true
+    ip route add 192.168.35.0/24 via 10.0.2.2 2>/dev/null || true
+
+    # Make them persistent by adding to a network config
+    local netdir="/etc/systemd/network"
+    mkdir -p "$netdir"
+    local route_file="$netdir/10-static-routes.network"
+    cat > "$route_file" <<EOF
+[Route]
+Destination=192.168.37.0/24
+Gateway=10.0.1.1
+
+[Route]
+Destination=192.168.34.0/24
+Gateway=10.0.2.2
+
+[Route]
+Destination=192.168.35.0/24
+Gateway=10.0.2.2
+EOF
+    info "Static routes added and made persistent."
 }
 
 # ----------------------------------------------------------------------
@@ -115,48 +134,60 @@ main() {
         blue-router)
             local nic1=$(get_interface_by_index 1)
             local nic2=$(get_interface_by_index 2)
-            assign_ip "$nic1" "10.0.1.1" "30" "10.0.1.2"   # gateway = Orange router
-            assign_ip "$nic2" "192.168.34.1" "24"          # no gateway (it's the gateway itself)
+            assign_ip "$nic1" "10.0.1.1" "30" "10.0.1.2"
+            assign_ip "$nic2" "192.168.37.1" "24"
             ;;
 
         orange-router)
             local nic1=$(get_interface_by_index 1)
             local nic2=$(get_interface_by_index 2)
             local nic3=$(get_interface_by_index 3)
-            assign_ip "$nic1" "10.0.1.2" "30"              # no default gateway unless external internet
+            local nic4=$(get_interface_by_index 4)
+
+            assign_ip "$nic1" "10.0.1.2" "30"
             assign_ip "$nic2" "10.0.2.1" "30"
-            assign_ip "$nic3" "172.34.0.1" "16"
+            assign_ip "$nic3" "172.36.0.1" "16"
+
+            # NAT adapter: DHCP
+            ip link set dev "$nic4" up
+            dhcpcd "$nic4" 2>/dev/null || true
+            info "NAT adapter $nic4 configured via DHCP (internet access)."
+
+            # Add static routes to reach Blue, Yellow, Green
+            add_static_routes_orange
             ;;
 
         yg-router)
             local nic1=$(get_interface_by_index 1)
             local nic2=$(get_interface_by_index 2)
-            assign_ip "$nic1" "10.0.2.2" "30" "10.0.2.1"   # gateway = Orange router
-            assign_ip "$nic2" "192.168.34.1" "24"          # no gateway
+            local nic3=$(get_interface_by_index 3)
+            assign_ip "$nic1" "10.0.2.2" "30" "10.0.2.1"
+            assign_ip "$nic2" "192.168.34.1" "24"
+            assign_ip "$nic3" "192.168.35.1" "24"
             ;;
 
         yellow-wap)
-            setup_wap_bridge   # handles everything (installs bridge-utils, creates bridge, sets IP/gateway)
+            setup_wap_bridge
             ;;
 
         green-phone-1)
             local nic1=$(get_interface_by_index 1)
-            assign_ip "$nic1" "192.168.34.10" "24" "192.168.34.1"
+            assign_ip "$nic1" "192.168.35.10" "24" "192.168.35.1"
             ;;
 
         green-phone-2)
             local nic1=$(get_interface_by_index 1)
-            assign_ip "$nic1" "192.168.34.11" "24" "192.168.34.1"
+            assign_ip "$nic1" "192.168.35.11" "24" "192.168.35.1"
             ;;
 
         orange-laptop)
             local nic1=$(get_interface_by_index 1)
-            assign_ip "$nic1" "172.34.0.10" "16" "172.34.0.1"
+            assign_ip "$nic1" "172.36.0.10" "16" "172.36.0.1"
             ;;
 
         blue-server)
             local nic1=$(get_interface_by_index 1)
-            assign_ip "$nic1" "192.168.34.100" "24" "192.168.34.1"
+            assign_ip "$nic1" "192.168.37.100" "24" "192.168.37.1"
             ;;
 
         yellow-laptop-1)
@@ -170,18 +201,22 @@ main() {
             ;;
 
         *)
-            die "Unknown hostname: $hostname. Please set one of: blue-router, orange-router, yg-router, yellow-wap, green-phone-1, green-phone-2, orange-laptop, blue-server, yellow-laptop-1, yellow-laptop-2."
+            die "Unknown hostname: $hostname"
             ;;
     esac
 
-    # Enable IP forwarding on routers? This script doesn't do that; use your separate forwarding script.
     info "Configuration complete for $hostname"
     echo
-    echo "Current IPv4 addresses and routes:"
+    echo "Current IPv4 addresses:"
     ip -4 addr show | grep -E "inet " | grep -v "127.0.0.1"
     echo
     echo "Default gateway:"
     ip route show default 2>/dev/null || echo "No default route set"
+    echo
+    if [[ "$hostname" == "orange-router" ]]; then
+        echo "Static routes on Orange:"
+        ip route show | grep "192.168"
+    fi
 }
 
 main "$@"
